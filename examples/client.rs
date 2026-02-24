@@ -37,31 +37,34 @@ async fn main() -> Result<()> {
     info!("Echo body: {}", String::from_utf8_lossy(&resp.body));
 
     info!("=== Realtime: joining channel 'chat' ===");
-    let mut stream = conn.realtime_connect("chat").await?;
+    let stream = conn.realtime_connect("chat").await?;
+
+    let (tx_stream, mut rx_stream) = stream.split();
+
+    tokio::spawn(async move {
+        info!("=== Listening for incoming realtime messages... ===");
+        while let Some(msg) = rx_stream.recv().await {
+            info!(
+                "[Realtime In] event='{}' payload={:?}",
+                msg.event, msg.payload
+            );
+        }
+        info!("Listener task closed.");
+    });
 
     for i in 0..3 {
-        stream
+        tx_stream
             .send(
                 "message",
                 serde_json::json!({ "text": format!("Hello #{}", i) }),
             )
             .await?;
-        info!("Sent message #{}", i);
+        info!("[Realtime Out] Sent message #{}", i);
+
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    info!("=== Listening for incoming realtime messages... ===");
-    loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv()).await {
-            Ok(Some(msg)) => {
-                info!("[Realtime] event='{}' payload={:?}", msg.event, msg.payload);
-            }
-            Ok(None) | Err(_) => {
-                info!("No more messages, done.");
-                break;
-            }
-        }
-    }
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     Ok(())
 }

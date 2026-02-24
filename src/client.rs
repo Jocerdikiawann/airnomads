@@ -69,6 +69,25 @@ impl RealtimeStreamHandle {
     pub async fn recv(&mut self) -> Option<RealtimeMessage> {
         self.rx.recv().await
     }
+    pub fn split(
+        self,
+    ) -> (
+        std::sync::Arc<Self>,
+        tokio::sync::mpsc::Receiver<crate::realtime::RealtimeMessage>,
+    ) {
+        let rx = self.rx;
+
+        let (_dummy_tx, dummy_rx) = tokio::sync::mpsc::channel(1);
+        let sender_only = Self {
+            stream_id: self.stream_id,
+            conn: self.conn,
+            rx: dummy_rx, // Tidak akan dipakai lagi
+            channel: self.channel,
+            socket: self.socket,
+        };
+
+        (std::sync::Arc::new(sender_only), rx)
+    }
 }
 
 impl H3Client {
@@ -405,7 +424,7 @@ impl H3ClientConn {
         }
     }
 
-    pub async fn webtransport_connect(&self, path: &str) -> Result<u64> {
+    async fn webtransport_connect(&self, path: &str) -> Result<u64> {
         if self.conn.is_closed().await {
             return Err(H3Error::ConnectionClosed);
         }

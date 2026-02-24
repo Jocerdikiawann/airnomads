@@ -399,6 +399,14 @@ impl H3Server {
 
                     if conn_arc.is_closed().await {
                         let uuid = &conn_arc.conn_id;
+
+                        let _ = conn_arc
+                            .realtime_tx
+                            .send(RealtimeEvent::Disconnected {
+                                conn_id: uuid.clone(),
+                            })
+                            .await;
+
                         connections.write().await.remove(uuid);
                         cid_map.write().await.retain(|_, v| v != uuid);
                         info!("Connection {uuid} removed");
@@ -465,6 +473,16 @@ impl H3Server {
                                 }
                             }
                         });
+                    } else if msg.event == "leave" {
+                        channel.unsubscribe(&msg.channel, &conn.conn_id).await;
+
+                        let _ = conn
+                            .realtime_tx
+                            .send(RealtimeEvent::Leave {
+                                conn_id: conn.conn_id.clone(),
+                                channel: msg.channel.clone(),
+                            })
+                            .await;
                     } else {
                         let _ = conn
                             .realtime_tx
