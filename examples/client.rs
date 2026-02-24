@@ -2,7 +2,7 @@ use airnomads::{
     H3Client, QuicConfig,
     error::{H3Error, Result},
 };
-use std::net::{AddrParseError, SocketAddr};
+use std::net::AddrParseError;
 use tracing::info;
 
 #[tokio::main]
@@ -11,17 +11,17 @@ async fn main() -> Result<()> {
         .with_env_filter("info,quic_h3=debug")
         .init();
 
-    let server_addr: SocketAddr = "0.0.0.0:4433"
-        .parse()
-        .map_err(|e: AddrParseError| H3Error::AddrErr(e.to_string()))?;
+    let client = H3Client::new(
+        "127.0.0.1:4433"
+            .parse()
+            .map_err(|e: AddrParseError| H3Error::AddrErr(e.to_string()))?,
+        "0.0.0.0:3344"
+            .parse()
+            .map_err(|e: AddrParseError| H3Error::AddrErr(e.to_string()))?,
+        QuicConfig::new().with_cert("./cert.pem", "./key.pem"), // dev
+        "quic.dev",
+    );
 
-    let local_addr: SocketAddr = "0.0.0.0:0"
-        .parse()
-        .map_err(|e: AddrParseError| H3Error::AddrErr(e.to_string()))?;
-
-    let config = QuicConfig::new().with_no_verify();
-
-    let client = H3Client::new(server_addr, local_addr, config, "localhost");
     let conn = client.connect().await?;
     conn.handshake().await?;
 
@@ -36,32 +36,32 @@ async fn main() -> Result<()> {
         .await?;
     info!("Echo body: {}", String::from_utf8_lossy(&resp.body));
 
-    info!("=== Realtime: joining channel 'chat' ===");
-    let mut stream = conn.realtime_connect("chat").await?;
-
-    for i in 0..3 {
-        stream
-            .send(
-                "message",
-                serde_json::json!({ "text": format!("Hello #{}", i) }),
-            )
-            .await?;
-        info!("Sent message #{}", i);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-
-    info!("=== Listening for incoming realtime messages... ===");
-    loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(2), stream.recv()).await {
-            Ok(Some(msg)) => {
-                info!("[Realtime] event='{}' payload={:?}", msg.event, msg.payload);
-            }
-            Ok(None) | Err(_) => {
-                info!("No more messages, done.");
-                break;
-            }
-        }
-    }
+    // info!("=== Realtime: joining channel 'chat' ===");
+    // let mut stream = conn.realtime_connect("chat").await?;
+    //
+    // for i in 0..3 {
+    //     stream
+    //         .send(
+    //             "message",
+    //             serde_json::json!({ "text": format!("Hello #{}", i) }),
+    //         )
+    //         .await?;
+    //     info!("Sent message #{}", i);
+    //     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // }
+    //
+    // info!("=== Listening for incoming realtime messages... ===");
+    // loop {
+    //     match tokio::time::timeout(std::time::Duration::from_secs(2), stream.recv()).await {
+    //         Ok(Some(msg)) => {
+    //             info!("[Realtime] event='{}' payload={:?}", msg.event, msg.payload);
+    //         }
+    //         Ok(None) | Err(_) => {
+    //             info!("No more messages, done.");
+    //             break;
+    //         }
+    //     }
+    // }
 
     Ok(())
 }

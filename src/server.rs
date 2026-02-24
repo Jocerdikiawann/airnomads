@@ -1,8 +1,8 @@
+use quiche::h3::NameValue;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use quiche::h3::NameValue;
 use tokio::net::UdpSocket;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
@@ -61,7 +61,6 @@ impl H3Response {
             body: body_bytes,
         }
     }
-
     pub fn ok(body: impl Into<Vec<u8>>) -> Self {
         let body = body.into();
         Self {
@@ -70,7 +69,6 @@ impl H3Response {
             body,
         }
     }
-
     pub fn not_found() -> Self {
         Self::json(404, serde_json::json!({ "error": "not found" }))
     }
@@ -82,6 +80,12 @@ pub struct H3Server {
     request_handler: Option<RequestHandler>,
     realtime_handler: Option<RealtimeHandler>,
     pub channel: RealtimeChannel,
+}
+
+struct PendingResponse {
+    conn: Arc<QuicConnection>,
+    stream_id: u64,
+    response: H3Response,
 }
 
 impl H3Server {
@@ -118,137 +122,284 @@ impl H3Server {
         info!("HTTP/3 server listening on {}", self.bind_addr);
 
         let mut quiche_config = self.config.build_quiche_config()?;
-
-        let connections: Arc<RwLock<HashMap<String, Arc<QuicConnection>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-
         let channel = Arc::new(self.channel.clone_handle());
         let req_handler = self.request_handler.clone();
         let rt_handler = self.realtime_handler.clone();
+
+        let connections: Arc<RwLock<HashMap<String, Arc<QuicConnection>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let cid_map: Arc<RwLock<HashMap<Vec<u8>, String>>> = Arc::new(RwLock::new(HashMap::new()));
+
+        let (resp_tx, mut resp_rx) = mpsc::channel::<PendingResponse>(256);
 
         let mut buf = [0u8; 65535];
         let mut out = [0u8; 1350];
 
         loop {
-            let (len, from) = match socket.recv_from(&mut buf).await {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("recv_from error: {e}");
-                    continue;
-                }
+            let from: SocketAddr;
+            let pkt_len: usize;
+            let is_incoming_packet: bool;
+
+            enum Event {
+                Packet { len: usize, from: SocketAddr },
+                Response(PendingResponse),
+            }
+
+            let event = tokio::select! {
+                result = socket.recv_from(&mut buf) => {
+                    match result {
+                        Ok((len, addr)) => Event::Packet { len, from: addr },
+                        Err(e) => { error!("recv_from: {e}"); continue; }
+                    }
+                },
+                Some(pending) = resp_rx.recv() => {
+                    Event::Response(pending)
+                },
             };
 
-            let mut pkt = &mut buf[..len];
+            match event {
+                Event::Response(pending) => {
+                    let PendingResponse {
+                        conn,
+                        stream_id,
+                        response,
+                    } = pending;
 
-            let hdr = match quiche::Header::from_slice(pkt, quiche::MAX_CONN_ID_LEN) {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!("Failed to parse QUIC header from {from}: {e}");
-                    continue;
-                }
-            };
+                    let status_str = response.status.to_string();
+                    let mut h3_headers = vec![
+                        quiche::h3::Header::new(b":status", status_str.as_bytes()),
+                        quiche::h3::Header::new(b"server", b"quic-h3/0.1"),
+                    ];
+                    for (k, v) in &response.headers {
+                        h3_headers.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
+                    }
 
-            let conn_id = format!("{:?}", hdr.dcid);
+                    if let Err(e) = conn
+                        .send_h3_response(stream_id, &h3_headers, Some(&response.body))
+                        .await
+                    {
+                        error!("send_h3_response stream {stream_id}: {e}");
+                        continue;
+                    }
 
-            let conn_arc = {
-                let conns = connections.read().await;
-                conns.get(&conn_id).cloned()
-            };
-
-            let conn_arc = if let Some(c) = conn_arc {
-                c
-            } else {
-                if hdr.ty != quiche::Type::Initial {
-                    warn!("Non-initial packet from unknown connection, dropping");
-                    continue;
-                }
-
-                let scid = quiche::ConnectionId::from_ref(&hdr.dcid);
-                let (rt_tx, mut rt_rx) = mpsc::channel::<RealtimeEvent>(256);
-
-                let quic_conn =
-                    quiche::accept(&scid, None, self.bind_addr, from, &mut quiche_config)?;
-
-                let conn = Arc::new(QuicConnection::new(conn_id.clone(), from, quic_conn, rt_tx));
-
-                connections
-                    .write()
-                    .await
-                    .insert(conn_id.clone(), conn.clone());
-
-                {
-                    let ch = Arc::clone(&channel);
-                    let rt_handler = rt_handler.clone();
-                    tokio::spawn(async move {
-                        while let Some(ev) = rt_rx.recv().await {
-                            if let Some(h) = &rt_handler {
-                                h(ev, Arc::clone(&ch)).await;
+                    let peer = conn.peer_addr;
+                    let mut quic = conn.quic.lock().await;
+                    loop {
+                        let (write, _) = match quic.send(&mut out) {
+                            Ok(v) => v,
+                            Err(quiche::Error::Done) => break,
+                            Err(e) => {
+                                error!("quic.send (resp): {e}");
+                                break;
                             }
+                        };
+                        if let Err(e) = socket.send_to(&out[..write], peer).await {
+                            error!("send_to (resp): {e}");
                         }
-                    });
+                    }
+                    debug!("Flushed response for stream {stream_id} to {peer}");
+                    continue;
                 }
 
-                info!("New QUIC connection from {from} id={conn_id}");
-                conn
-            };
+                Event::Packet {
+                    len,
+                    from: pkt_from,
+                } => {
+                    let pkt = &mut buf[..len];
 
-            {
-                let recv_info = quiche::RecvInfo {
-                    to: self.bind_addr,
-                    from,
-                };
-                let mut quic = conn_arc.quic.lock().await;
-                if let Err(e) = quic.recv(&mut pkt, recv_info) {
-                    warn!("quic.recv error: {e}");
-                }
-            }
-
-            if conn_arc.is_established().await && conn_arc.h3.lock().await.is_none() {
-                conn_arc.init_h3_server().await?;
-            }
-
-            if conn_arc.h3.lock().await.is_some() {
-                Self::process_h3_events(&conn_arc, &channel, req_handler.as_ref()).await;
-            }
-
-            Self::process_realtime_streams(&conn_arc, &channel).await;
-
-            {
-                let mut quic = conn_arc.quic.lock().await;
-                loop {
-                    let (write, _) = match quic.send(&mut out) {
-                        Ok(v) => v,
-                        Err(quiche::Error::Done) => break,
+                    let hdr = match quiche::Header::from_slice(pkt, quiche::MAX_CONN_ID_LEN) {
+                        Ok(h) => h,
                         Err(e) => {
-                            error!("quic.send error: {e}");
-                            break;
+                            warn!("Bad QUIC header from {pkt_from}: {e}");
+                            continue;
                         }
                     };
-                    if let Err(e) = socket.send_to(&out[..write], from).await {
-                        error!("send_to error: {e}");
+
+                    let dcid_bytes: Vec<u8> = hdr.dcid.as_ref().to_vec();
+
+                    let conn_arc: Option<Arc<QuicConnection>> = {
+                        let cids = cid_map.read().await;
+                        if let Some(uuid) = cids.get(&dcid_bytes) {
+                            connections.read().await.get(uuid).cloned()
+                        } else {
+                            None
+                        }
+                    };
+
+                    let conn_arc: Arc<QuicConnection> = if let Some(c) = conn_arc {
+                        c
+                    } else if hdr.ty != quiche::Type::Initial {
+                        let fallback = {
+                            let conns = connections.read().await;
+                            conns
+                                .values()
+                                .find(|c| {
+                                    if c.peer_addr != pkt_from {
+                                        return false;
+                                    }
+                                    c.quic.try_lock().map(|q| !q.is_closed()).unwrap_or(true)
+                                })
+                                .cloned()
+                        };
+                        if let Some(c) = fallback {
+                            cid_map
+                                .write()
+                                .await
+                                .insert(dcid_bytes.clone(), c.conn_id.clone());
+                            debug!(
+                                "Short dcid=0x{} resolved via peer {} → {}",
+                                hex::encode(&dcid_bytes),
+                                pkt_from,
+                                c.conn_id
+                            );
+                            c
+                        } else {
+                            warn!(
+                                "Non-initial ({:?}) from {pkt_from}, dcid=0x{} — drop",
+                                hdr.ty,
+                                hex::encode(&dcid_bytes)
+                            );
+                            continue;
+                        }
+                    } else {
+                        let scid = quiche::ConnectionId::from_ref(&hdr.dcid);
+                        let internal_id = QuicConnection::generate_conn_id();
+                        let (rt_tx, mut rt_rx) = mpsc::channel::<RealtimeEvent>(256);
+
+                        let quic_conn = match quiche::accept(
+                            &scid,
+                            None,
+                            self.bind_addr,
+                            pkt_from,
+                            &mut quiche_config,
+                        ) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                error!("quiche::accept: {e}");
+                                continue;
+                            }
+                        };
+
+                        let conn = Arc::new(QuicConnection::new(
+                            internal_id.clone(),
+                            pkt_from,
+                            quic_conn,
+                            rt_tx,
+                        ));
+                        cid_map
+                            .write()
+                            .await
+                            .insert(dcid_bytes.clone(), internal_id.clone());
+                        connections
+                            .write()
+                            .await
+                            .insert(internal_id.clone(), conn.clone());
+
+                        {
+                            let ch = Arc::clone(&channel);
+                            let rt_h = rt_handler.clone();
+                            tokio::spawn(async move {
+                                while let Some(ev) = rt_rx.recv().await {
+                                    if let Some(h) = &rt_h {
+                                        h(ev, Arc::clone(&ch)).await;
+                                    }
+                                }
+                            });
+                        }
+
+                        info!("New connection from {pkt_from} → {internal_id}");
+                        conn
+                    };
+
+                    {
+                        let recv_info = quiche::RecvInfo {
+                            to: self.bind_addr,
+                            from: pkt_from,
+                        };
+                        let mut quic = conn_arc.quic.lock().await;
+                        if let Err(e) = quic.recv(pkt, recv_info) {
+                            warn!("quic.recv {}: {e}", conn_arc.conn_id);
+                        }
+                    }
+
+                    if conn_arc.is_established().await && conn_arc.h3.lock().await.is_none() {
+                        if let Err(e) = conn_arc.init_h3_server().await {
+                            error!("H3 init {}: {e}", conn_arc.conn_id);
+                        } else {
+                            info!("H3 ready for {}", conn_arc.conn_id);
+                        }
+                    }
+
+                    if conn_arc.h3.lock().await.is_some() {
+                        Self::process_h3_events(&conn_arc, req_handler.as_ref(), &resp_tx).await;
+                    }
+
+                    Self::process_realtime_streams(&conn_arc, &channel).await;
+
+                    {
+                        let mut quic = conn_arc.quic.lock().await;
+                        loop {
+                            let (write, _) = match quic.send(&mut out) {
+                                Ok(v) => v,
+                                Err(quiche::Error::Done) => break,
+                                Err(e) => {
+                                    error!("quic.send: {e}");
+                                    break;
+                                }
+                            };
+                            if let Err(e) = socket.send_to(&out[..write], pkt_from).await {
+                                error!("send_to: {e}");
+                            }
+                        }
+                    }
+
+                    {
+                        let quic = conn_arc.quic.lock().await;
+                        let uuid = conn_arc.conn_id.clone();
+                        let mut cids = cid_map.write().await;
+                        for cid in quic.source_ids() {
+                            let key = cid.as_ref().to_vec();
+                            cids.entry(key).or_insert_with(|| {
+                                debug!("+ source CID 0x{} → {uuid}", hex::encode(cid.as_ref()));
+                                uuid.clone()
+                            });
+                        }
+
+                        {
+                            let key = quic.destination_id().as_ref().to_vec();
+                            cids.entry(key).or_insert_with(|| {
+                                debug!(
+                                    "+ dest   CID 0x{} → {uuid}",
+                                    hex::encode(quic.destination_id().as_ref())
+                                );
+                                uuid.clone()
+                            });
+                        }
+                    }
+
+                    if conn_arc.is_closed().await {
+                        let uuid = &conn_arc.conn_id;
+                        connections.write().await.remove(uuid);
+                        cid_map.write().await.retain(|_, v| v != uuid);
+                        info!("Connection {uuid} removed");
                     }
                 }
-            }
-
-            if conn_arc.is_closed().await {
-                connections.write().await.remove(&conn_id);
-                info!("Connection {conn_id} closed");
             }
         }
     }
 
     async fn process_h3_events(
         conn: &Arc<QuicConnection>,
-        channel: &Arc<RealtimeChannel>,
         handler: Option<&RequestHandler>,
+        resp_tx: &mpsc::Sender<PendingResponse>,
     ) {
-        let mut pending_requests: HashMap<u64, H3Request> = HashMap::new();
+        let mut pending: HashMap<u64, H3Request> = HashMap::new();
 
         loop {
             let event = {
                 let mut quic = conn.quic.lock().await;
-                let mut h3_guard = conn.h3.lock().await;
-                let h3 = match h3_guard.as_mut() {
+                let mut h3g = conn.h3.lock().await;
+                let h3 = match h3g.as_mut() {
                     Some(h) => h,
                     None => break,
                 };
@@ -256,18 +407,19 @@ impl H3Server {
                     Ok(ev) => ev,
                     Err(quiche::h3::Error::Done) => break,
                     Err(e) => {
-                        warn!("H3 poll error: {e}");
+                        warn!("H3 poll {}: {e}", conn.conn_id);
                         break;
                     }
                 }
             };
+
+            info!("Event disini loh yah {:?}", event);
 
             match event {
                 (stream_id, quiche::h3::Event::Headers { list, .. }) => {
                     let mut method = String::new();
                     let mut path = String::new();
                     let mut headers = Vec::new();
-
                     for hdr in &list {
                         let k = std::str::from_utf8(hdr.name()).unwrap_or("").to_string();
                         let v = std::str::from_utf8(hdr.value()).unwrap_or("").to_string();
@@ -277,16 +429,14 @@ impl H3Server {
                             _ => headers.push((k, v)),
                         }
                     }
-
-                    debug!("H3 request: {method} {path} on stream {stream_id}");
-
-                    pending_requests.insert(
+                    debug!("H3 {method} {path} stream={stream_id}");
+                    pending.insert(
                         stream_id,
                         H3Request {
                             method,
                             path,
                             headers,
-                            body: Vec::new(),
+                            body: vec![],
                             stream_id,
                             conn_id: conn.conn_id.clone(),
                         },
@@ -295,46 +445,38 @@ impl H3Server {
 
                 (stream_id, quiche::h3::Event::Data) => {
                     let mut body_buf = [0u8; 65535];
-                    let read = {
+                    let n = {
                         let mut quic = conn.quic.lock().await;
-                        let mut h3_guard = conn.h3.lock().await;
-                        if let Some(h3) = h3_guard.as_mut() {
-                            h3.recv_body(&mut *quic, stream_id, &mut body_buf)
-                                .unwrap_or(0)
-                        } else {
-                            0
-                        }
+                        let mut h3g = conn.h3.lock().await;
+                        h3g.as_mut()
+                            .map(|h| {
+                                h.recv_body(&mut *quic, stream_id, &mut body_buf)
+                                    .unwrap_or(0)
+                            })
+                            .unwrap_or(0)
                     };
-
-                    if let Some(req) = pending_requests.get_mut(&stream_id) {
-                        req.body.extend_from_slice(&body_buf[..read]);
+                    if let Some(req) = pending.get_mut(&stream_id) {
+                        req.body.extend_from_slice(&body_buf[..n]);
                     }
                 }
 
                 (stream_id, quiche::h3::Event::Finished) => {
-                    if let Some(req) = pending_requests.remove(&stream_id) {
-                        // Dispatch ke request handler
+                    if let Some(req) = pending.remove(&stream_id) {
                         if let Some(h) = handler {
-                            let conn_clone = Arc::clone(conn);
-                            let h_clone = Arc::clone(h);
-                            let conn_for_resp = Arc::clone(conn);
+                            let conn_c = Arc::clone(conn);
+                            let h_c = Arc::clone(h);
+                            let resp_tx_c = resp_tx.clone();
                             tokio::spawn(async move {
-                                let response = h_clone(req, conn_clone).await;
-                                // Kirim response
-                                let status_str = response.status.to_string();
-                                let mut h3_headers = vec![
-                                    quiche::h3::Header::new(b":status", status_str.as_bytes()),
-                                    quiche::h3::Header::new(b"server", b"quic-h3/0.1"),
-                                ];
-                                for (k, v) in &response.headers {
-                                    h3_headers
-                                        .push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
-                                }
-                                if let Err(e) = conn_for_resp
-                                    .send_h3_response(stream_id, &h3_headers, Some(&response.body))
+                                let response = h_c(req, Arc::clone(&conn_c)).await;
+                                if let Err(e) = resp_tx_c
+                                    .send(PendingResponse {
+                                        conn: conn_c,
+                                        stream_id,
+                                        response,
+                                    })
                                     .await
                                 {
-                                    error!("Failed to send H3 response: {e}");
+                                    error!("Failed to send pending response: {e}");
                                 }
                             });
                         }
@@ -347,13 +489,7 @@ impl H3Server {
     }
 
     async fn process_realtime_streams(conn: &Arc<QuicConnection>, channel: &Arc<RealtimeChannel>) {
-        let mut buf = [0u8; 65535];
-        let mut stream_buf: HashMap<u64, Vec<u8>> = HashMap::new();
-
-        let readable: Vec<u64> = {
-            let quic = conn.quic.lock().await;
-            quic.readable().collect()
-        };
+        let readable: Vec<u64> = conn.quic.lock().await.readable().collect();
 
         for stream_id in readable {
             {
@@ -365,23 +501,22 @@ impl H3Server {
                 }
             }
 
-            let read = {
+            let mut buf = [0u8; 65535];
+            let n = {
                 let mut quic = conn.quic.lock().await;
                 match quic.stream_recv(stream_id, &mut buf) {
                     Ok((n, _)) => n,
                     Err(quiche::Error::Done) => continue,
                     Err(e) => {
-                        warn!("stream_recv error on {stream_id}: {e}");
+                        warn!("stream_recv {stream_id}: {e}");
                         continue;
                     }
                 }
             };
 
-            let entry = stream_buf.entry(stream_id).or_default();
-            entry.extend_from_slice(&buf[..read]);
-
-            while let Some((msg, consumed)) = parse_realtime_frame(entry) {
-                entry.drain(..consumed);
+            let mut tmp = buf[..n].to_vec();
+            while let Some((msg, consumed)) = parse_realtime_frame(&tmp) {
+                tmp.drain(..consumed);
 
                 if msg.event == "join" {
                     let ch = msg.channel.clone();
@@ -400,35 +535,35 @@ impl H3Server {
                     let _ = conn
                         .realtime_tx
                         .send(RealtimeEvent::Join {
-                            conn_id: cid.clone(),
-                            channel: ch.clone(),
+                            conn_id: cid,
+                            channel: ch,
                             stream_id,
                         })
                         .await;
 
-                    let conn_clone = Arc::clone(conn);
+                    let conn_c = Arc::clone(conn);
                     tokio::spawn(async move {
-                        while let Some(broadcast_msg) = rx.recv().await {
-                            if let Ok(frame) = encode_realtime_frame(&broadcast_msg) {
-                                let mut quic = conn_clone.quic.lock().await;
-                                let _ = quic.stream_send(stream_id, &frame, false);
+                        while let Some(bcast) = rx.recv().await {
+                            if let Ok(frame) = encode_realtime_frame(&bcast) {
+                                let _ = conn_c
+                                    .quic
+                                    .lock()
+                                    .await
+                                    .stream_send(stream_id, &frame, false);
                             }
                         }
                     });
                 } else {
-                    let channel_name = {
-                        conn.streams
-                            .lock()
-                            .await
-                            .get(&stream_id)
-                            .and_then(|m| m.channel.clone())
-                    };
-
-                    if let Some(ch) = channel_name {
+                    let ch_name = conn
+                        .streams
+                        .lock()
+                        .await
+                        .get(&stream_id)
+                        .and_then(|m| m.channel.clone());
+                    if let Some(ch) = ch_name {
                         channel
                             .broadcast(&ch, msg.clone(), Some(&conn.conn_id))
                             .await;
-
                         let _ = conn
                             .realtime_tx
                             .send(RealtimeEvent::Message {

@@ -20,9 +20,7 @@ async fn main() -> Result<()> {
         .parse()
         .map_err(|e: AddrParseError| H3Error::AddrErr(e.to_string()))?;
 
-    let config = QuicConfig::new()
-        .with_cert("cert.pem", "key.pem")
-        .with_max_streams_bidi(200);
+    let config = QuicConfig::new().with_cert("./cert.pem", "./key.pem");
 
     let server = H3Server::new(bind, config)
         .on_request(
