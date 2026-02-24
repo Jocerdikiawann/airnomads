@@ -10,9 +10,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::QuicConfig;
 use crate::connection::{QuicConnection, StreamMeta, StreamType};
 use crate::error::Result;
-use crate::realtime::{
-    RealtimeChannel, RealtimeEvent, encode_realtime_frame, parse_realtime_frame,
-};
+use crate::realtime::{RealtimeChannel, RealtimeEvent, parse_realtime_frame};
 
 pub type RequestHandler = Arc<
     dyn Fn(
@@ -441,35 +439,33 @@ impl H3Server {
                         let peer_addr = conn_c.peer_addr;
 
                         tokio::spawn(async move {
-                            while let Some(broadcast_msg) = rx.recv().await {
-                                if let Ok(json_frame) =
-                                    crate::realtime::encode_realtime_frame(&broadcast_msg)
-                                {
-                                    let mut final_payload =
-                                        crate::realtime::encode_quic_varint(sid);
-                                    final_payload.extend_from_slice(&json_frame);
+                            while let Some(shared_frame) = rx.recv().await {
+                                let varint = crate::realtime::encode_quic_varint(sid);
 
-                                    {
-                                        let mut quic = conn_c.quic.lock().await;
-                                        if let Err(e) = quic.dgram_send(&final_payload) {
-                                            tracing::warn!(
-                                                "failed send broadcast datagram to client: {}",
-                                                e
-                                            );
+                                let mut final_payload =
+                                    Vec::with_capacity(varint.len() + shared_frame.len());
+                                final_payload.extend_from_slice(&varint);
+                                final_payload.extend_from_slice(&shared_frame);
+
+                                let mut quic = conn_c.quic.lock().await;
+                                if let Err(e) = quic.dgram_send(&final_payload) {
+                                    tracing::warn!(
+                                        "Gagal kirim broadcast datagram ke client: {}",
+                                        e
+                                    );
+                                }
+                                drop(quic);
+
+                                let mut out = [0u8; 1350];
+                                loop {
+                                    let write = {
+                                        let mut q = conn_c.quic.lock().await;
+                                        match q.send(&mut out) {
+                                            Ok((w, _)) => w,
+                                            Err(_) => break,
                                         }
-                                    }
-
-                                    let mut out = [0u8; 1350];
-                                    loop {
-                                        let write = {
-                                            let mut quic = conn_c.quic.lock().await;
-                                            match quic.send(&mut out) {
-                                                Ok((w, _)) => w,
-                                                Err(_) => break,
-                                            }
-                                        };
-                                        let _ = socket_c.send_to(&out[..write], peer_addr).await;
-                                    }
+                                    };
+                                    let _ = socket_c.send_to(&out[..write], peer_addr).await;
                                 }
                             }
                         });
@@ -683,13 +679,11 @@ impl H3Server {
                     let conn_c = Arc::clone(conn);
                     tokio::spawn(async move {
                         while let Some(bcast) = rx.recv().await {
-                            if let Ok(frame) = encode_realtime_frame(&bcast) {
-                                let _ = conn_c
-                                    .quic
-                                    .lock()
-                                    .await
-                                    .stream_send(stream_id, &frame, false);
-                            }
+                            let _ = conn_c
+                                .quic
+                                .lock()
+                                .await
+                                .stream_send(stream_id, &bcast, false);
                         }
                     });
                 } else {

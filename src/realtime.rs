@@ -49,7 +49,7 @@ pub enum RealtimeEvent {
     },
 }
 
-type Subscriber = mpsc::Sender<RealtimeMessage>;
+type Subscriber = mpsc::Sender<bytes::Bytes>;
 
 pub struct RealtimeChannel {
     channels: Arc<RwLock<HashMap<String, HashMap<String, Subscriber>>>>,
@@ -62,7 +62,7 @@ impl RealtimeChannel {
         }
     }
 
-    pub async fn subscribe(&self, channel: &str, conn_id: &str) -> mpsc::Receiver<RealtimeMessage> {
+    pub async fn subscribe(&self, channel: &str, conn_id: &str) -> mpsc::Receiver<bytes::Bytes> {
         let (tx, rx) = mpsc::channel(256);
         let mut chans = self.channels.write().await;
         chans
@@ -95,6 +95,16 @@ impl RealtimeChannel {
             return 0;
         };
 
+        let encoded_vec = match crate::realtime::encode_realtime_frame(&msg) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("failed encode broadcast: {}", e);
+                return 0;
+            }
+        };
+
+        let shared_frame = bytes::Bytes::from(encoded_vec);
+
         let mut sent = 0;
         for (conn_id, tx) in subs.iter() {
             if let Some(exc) = exclude_conn {
@@ -102,14 +112,15 @@ impl RealtimeChannel {
                     continue;
                 }
             }
-            if tx.send(msg.clone()).await.is_ok() {
+
+            if tx.send(shared_frame.clone()).await.is_ok() {
                 sent += 1;
             }
         }
         sent
     }
 
-    pub async fn send_to(&self, channel: &str, conn_id: &str, msg: RealtimeMessage) -> Result<()> {
+    pub async fn send_to(&self, channel: &str, conn_id: &str, msg: bytes::Bytes) -> Result<()> {
         let chans = self.channels.read().await;
         let subs = chans
             .get(channel)
