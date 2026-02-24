@@ -66,5 +66,10 @@ async fn main() -> Result<()> {
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
+    tx_stream
+        .send("leave", serde_json::json!({"msg": "im leaving, thanks"}))
+        .await?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     Ok(())
 }
