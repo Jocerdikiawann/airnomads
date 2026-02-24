@@ -57,7 +57,9 @@ impl RealtimeStreamHandle {
                 match quic.send(&mut out) {
                     Ok((w, _)) => w,
                     Err(quiche::Error::Done) => break,
-                    Err(e) => return Err(crate::error::H3Error::InvalidFrame(e.to_string())),
+                    Err(e) => {
+                        return Err(crate::error::H3Error::InvalidFrame(e.to_string()));
+                    }
                 }
             };
             let _ = self.socket.send(&out[..write]).await;
@@ -334,6 +336,7 @@ impl H3ClientConn {
                     }
                 };
 
+                info!("rt_rx {:?}", self.rt_rx);
                 match event {
                     (sid, quiche::h3::Event::Headers { list, .. }) if sid == stream_id => {
                         for hdr in &list {
