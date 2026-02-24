@@ -136,9 +136,9 @@ impl H3Server {
         let mut out = [0u8; 1350];
 
         loop {
-            let from: SocketAddr;
-            let pkt_len: usize;
-            let is_incoming_packet: bool;
+            // let from: SocketAddr;
+            // let pkt_len: usize;
+            // let is_incoming_packet: bool;
 
             enum Event {
                 Packet { len: usize, from: SocketAddr },
@@ -262,6 +262,26 @@ impl H3Server {
                             continue;
                         }
                     } else {
+                        {
+                            let old = {
+                                let conns = connections.read().await;
+                                conns
+                                    .values()
+                                    .find(|c| c.peer_addr == pkt_from)
+                                    .map(|c| (c.conn_id.clone(), Arc::clone(c)))
+                            };
+                            if let Some((old_uuid, old_conn)) = old {
+                                info!(
+                                    "Retiring old connection {old_uuid} for peer {pkt_from} (client reconnect)"
+                                );
+                                if let Ok(mut quic) = old_conn.quic.try_lock() {
+                                    let _ = quic.close(false, 0, b"superseded");
+                                }
+                                connections.write().await.remove(&old_uuid);
+                                cid_map.write().await.retain(|_, v| v != &old_uuid);
+                            }
+                        }
+
                         let scid = quiche::ConnectionId::from_ref(&hdr.dcid);
                         let internal_id = QuicConnection::generate_conn_id();
                         let (rt_tx, mut rt_rx) = mpsc::channel::<RealtimeEvent>(256);
@@ -364,7 +384,6 @@ impl H3Server {
                                 uuid.clone()
                             });
                         }
-
                         {
                             let key = quic.destination_id().as_ref().to_vec();
                             cids.entry(key).or_insert_with(|| {
@@ -412,8 +431,6 @@ impl H3Server {
                     }
                 }
             };
-
-            info!("Event disini loh yah {:?}", event);
 
             match event {
                 (stream_id, quiche::h3::Event::Headers { list, .. }) => {
