@@ -166,3 +166,55 @@ pub fn encode_realtime_frame(msg: &RealtimeMessage) -> Result<Vec<u8>> {
     out.extend_from_slice(&json);
     Ok(out)
 }
+
+/*
+* TODO: Web transport standart ietf
+*/
+pub fn encode_quic_varint(val: u64) -> Vec<u8> {
+    if val <= 0x3F {
+        vec![val as u8]
+    } else if val <= 0x3FFF {
+        let mut buf = vec![0; 2];
+        buf[0] = 0x40 | ((val >> 8) as u8);
+        buf[1] = (val & 0xFF) as u8;
+        buf
+    } else if val <= 0x3FFFFFFF {
+        let mut buf = vec![0; 4];
+        buf[0] = 0x80 | ((val >> 24) as u8);
+        buf[1] = ((val >> 16) & 0xFF) as u8;
+        buf[2] = ((val >> 8) & 0xFF) as u8;
+        buf[3] = (val & 0xFF) as u8;
+        buf
+    } else {
+        let mut buf = vec![0; 8];
+        buf[0] = 0xC0 | ((val >> 56) as u8);
+        buf[1] = ((val >> 48) & 0xFF) as u8;
+        buf[2] = ((val >> 40) & 0xFF) as u8;
+        buf[3] = ((val >> 32) & 0xFF) as u8;
+        buf[4] = ((val >> 24) & 0xFF) as u8;
+        buf[5] = ((val >> 16) & 0xFF) as u8;
+        buf[6] = ((val >> 8) & 0xFF) as u8;
+        buf[7] = (val & 0xFF) as u8;
+        buf
+    }
+}
+
+pub fn decode_quic_varint(buf: &[u8]) -> Option<(u64, usize)> {
+    if buf.is_empty() {
+        return None;
+    }
+
+    let prefix = buf[0] >> 6;
+    let length = 1 << prefix;
+
+    if buf.len() < length {
+        return None;
+    }
+
+    let mut val = (buf[0] & 0x3F) as u64;
+    for i in 1..length {
+        val = (val << 8) | (buf[i] as u64);
+    }
+
+    Some((val, length))
+}

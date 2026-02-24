@@ -355,6 +355,7 @@ impl H3Server {
                     }
 
                     Self::process_realtime_streams(&conn_arc, &channel).await;
+                    Self::process_datagrams(&conn_arc, &channel, &socket).await;
 
                     {
                         let mut quic = conn_arc.quic.lock().await;
@@ -407,6 +408,78 @@ impl H3Server {
         }
     }
 
+    pub async fn process_datagrams(
+        conn: &Arc<QuicConnection>,
+        channel: &Arc<RealtimeChannel>,
+        socket: &Arc<UdpSocket>,
+    ) {
+        let mut buf = [0u8; 65535];
+
+        let mut quic = conn.quic.lock().await;
+
+        while let Ok(len) = quic.dgram_recv(&mut buf) {
+            let raw_data = &buf[..len];
+
+            if let Some((session_id, varint_len)) = crate::realtime::decode_quic_varint(raw_data) {
+                let actual_json_data = &raw_data[varint_len..];
+                debug!("receive datagram {} bytes from conn {}", len, session_id);
+
+                if let Some((msg, _)) = parse_realtime_frame(actual_json_data) {
+                    if msg.event == "join" {
+                        let mut rx = channel.subscribe(&msg.channel, &conn.conn_id).await;
+                        let conn_c = Arc::clone(conn);
+                        let sid = session_id;
+                        let socket_c = Arc::clone(socket);
+                        let peer_addr = conn_c.peer_addr;
+
+                        tokio::spawn(async move {
+                            while let Some(broadcast_msg) = rx.recv().await {
+                                if let Ok(json_frame) =
+                                    crate::realtime::encode_realtime_frame(&broadcast_msg)
+                                {
+                                    let mut final_payload =
+                                        crate::realtime::encode_quic_varint(sid);
+                                    final_payload.extend_from_slice(&json_frame);
+
+                                    {
+                                        let mut quic = conn_c.quic.lock().await;
+                                        if let Err(e) = quic.dgram_send(&final_payload) {
+                                            tracing::warn!(
+                                                "failed send broadcast datagram to client: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+
+                                    let mut out = [0u8; 1350];
+                                    loop {
+                                        let write = {
+                                            let mut quic = conn_c.quic.lock().await;
+                                            match quic.send(&mut out) {
+                                                Ok((w, _)) => w,
+                                                Err(_) => break,
+                                            }
+                                        };
+                                        let _ = socket_c.send_to(&out[..write], peer_addr).await;
+                                    }
+                                }
+                            }
+                        });
+                    } else {
+                        let _ = conn
+                            .realtime_tx
+                            .send(RealtimeEvent::Message {
+                                conn_id: conn.conn_id.clone(),
+                                stream_id: session_id,
+                                msg,
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
     async fn process_h3_events(
         conn: &Arc<QuicConnection>,
         handler: Option<&RequestHandler>,
@@ -422,11 +495,14 @@ impl H3Server {
                     Some(h) => h,
                     None => break,
                 };
-                match h3.poll(&mut *quic) {
+                match h3.poll(&mut quic) {
                     Ok(ev) => ev,
                     Err(quiche::h3::Error::Done) => break,
                     Err(e) => {
-                        warn!("H3 poll {}: {e}", conn.conn_id);
+                        warn!(
+                            "[process_h3_events] H3 poll error on connection {}: {:?}",
+                            conn.conn_id, e
+                        );
                         break;
                     }
                 }
@@ -437,15 +513,43 @@ impl H3Server {
                     let mut method = String::new();
                     let mut path = String::new();
                     let mut headers = Vec::new();
+                    let mut protocol = String::new();
+
                     for hdr in &list {
                         let k = std::str::from_utf8(hdr.name()).unwrap_or("").to_string();
                         let v = std::str::from_utf8(hdr.value()).unwrap_or("").to_string();
                         match k.as_str() {
                             ":method" => method = v,
                             ":path" => path = v,
+                            ":protocol" => protocol = v,
                             _ => headers.push((k, v)),
                         }
                     }
+                    if method == "CONNECT" && protocol == "webtransport" {
+                        debug!("Receiving request webtransport on stream_id={}", stream_id);
+                        let rep_headers = vec![
+                            quiche::h3::Header::new(b":status", b"200"),
+                            quiche::h3::Header::new(b"sec-webtransport-http3-draft", b"draft02"),
+                        ];
+
+                        let mut quic = conn.quic.lock().await;
+                        let mut h3g = conn.h3.lock().await;
+
+                        if let Some(h3) = h3g.as_mut() {
+                            if let Err(e) =
+                                h3.send_response(&mut *quic, stream_id, &rep_headers, false)
+                            {
+                                error!("Failed send response webtransport: {e}");
+                            } else {
+                                info!(
+                                    "Session webtransport success created, session id: {stream_id}"
+                                );
+                            }
+                        }
+
+                        continue;
+                    }
+
                     debug!("H3 {method} {path} stream={stream_id}");
                     pending.insert(
                         stream_id,

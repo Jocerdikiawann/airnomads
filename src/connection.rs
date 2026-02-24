@@ -63,7 +63,10 @@ impl QuicConnection {
     }
 
     pub async fn init_h3_client(&self) -> Result<()> {
-        let h3_config = quiche::h3::Config::new()?;
+        let mut h3_config = quiche::h3::Config::new()?;
+        h3_config.set_max_field_section_size(8192);
+        h3_config.enable_extended_connect(true);
+
         let mut quic = self.quic.lock().await;
         let h3 = quiche::h3::Connection::with_transport(&mut *quic, &h3_config)?;
         *self.h3.lock().await = Some(h3);

@@ -31,12 +31,39 @@ pub struct RealtimeStreamHandle {
     pub stream_id: u64,
     conn: Arc<QuicConnection>,
     pub rx: mpsc::Receiver<RealtimeMessage>,
+    pub channel: String,
+    pub socket: Arc<UdpSocket>,
 }
 
 impl RealtimeStreamHandle {
     pub async fn send(&self, event: &str, payload: serde_json::Value) -> Result<()> {
-        let msg = RealtimeMessage::new(event, "", payload);
-        self.conn.send_realtime(self.stream_id, &msg).await
+        let msg = RealtimeMessage::new(event, &self.channel, payload);
+        let json_frame = crate::realtime::encode_realtime_frame(&msg)?;
+
+        let mut final_payload = crate::realtime::encode_quic_varint(self.stream_id);
+        final_payload.extend_from_slice(&json_frame);
+
+        {
+            let mut quic = self.conn.quic.lock().await;
+            if let Err(e) = quic.dgram_send(&final_payload) {
+                tracing::warn!("failed send datagram: {}", e);
+            }
+        }
+
+        let mut out = [0u8; 1350];
+        loop {
+            let write = {
+                let mut quic = self.conn.quic.lock().await;
+                match quic.send(&mut out) {
+                    Ok((w, _)) => w,
+                    Err(quiche::Error::Done) => break,
+                    Err(e) => return Err(crate::error::H3Error::InvalidFrame(e.to_string())),
+                }
+            };
+            let _ = self.socket.send(&out[..write]).await;
+        }
+
+        Ok(())
     }
 
     pub async fn recv(&mut self) -> Option<RealtimeMessage> {
@@ -378,8 +405,96 @@ impl H3ClientConn {
         }
     }
 
+    pub async fn webtransport_connect(&self, path: &str) -> Result<u64> {
+        if self.conn.is_closed().await {
+            return Err(H3Error::ConnectionClosed);
+        }
+
+        let headers = vec![
+            quiche::h3::Header::new(b":method", b"CONNECT"),
+            quiche::h3::Header::new(b":protocol", b"webtransport"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"localhost"),
+            quiche::h3::Header::new(b":path", path.as_bytes()),
+            quiche::h3::Header::new(b"sec-webtransport-http3-draft", b"draft02"),
+        ];
+
+        let stream_id = {
+            let mut quic = self.conn.quic.lock().await;
+            let mut h3g = self.conn.h3.lock().await;
+            let h3 = h3g.as_mut().ok_or(H3Error::ConnectionClosed)?;
+            h3.send_request(&mut *quic, &headers, false)?
+        };
+
+        self.flush().await?;
+
+        let mut buf = [0u8; 65535];
+        let mut out = [0u8; 1350];
+
+        loop {
+            let Ok(len) = self.socket.recv(&mut buf).await else {
+                return Err(H3Error::ConnectionClosed);
+            };
+
+            let recv_info = quiche::RecvInfo {
+                to: self.local_addr,
+                from: self.server_addr,
+            };
+
+            {
+                let mut quic = self.conn.quic.lock().await;
+                let _ = quic.recv(&mut buf[..len], recv_info);
+            }
+
+            self.flush_raw(&mut out).await?;
+
+            let mut quic = self.conn.quic.lock().await;
+            let mut h3g = self.conn.h3.lock().await;
+            let h3 = h3g.as_mut().unwrap();
+
+            match h3.poll(&mut *quic) {
+                Ok((sid, quiche::h3::Event::Headers { list, .. })) if sid == stream_id => {
+                    let mut status = 0;
+                    for hdr in &list {
+                        if hdr.name() == b":status" {
+                            let v = std::str::from_utf8(hdr.value()).unwrap_or("");
+                            status = v.parse().unwrap_or(0);
+                        }
+                    }
+                    if status >= 200 && status < 300 {
+                        info!(
+                            "WebTransport session established! Session ID: {}",
+                            stream_id
+                        );
+                        return Ok(stream_id);
+                    } else {
+                        return Err(H3Error::InvalidFrame(format!(
+                            "WebTransport ditolak: {}",
+                            status
+                        )));
+                    }
+                }
+                Ok(_) => continue,
+                Err(quiche::h3::Error::Done) => continue,
+                Err(e) => return Err(H3Error::InvalidFrame(format!("H3 Poll error: {:?}", e))),
+            }
+        }
+    }
+
     pub async fn realtime_connect(&self, channel: &str) -> Result<RealtimeStreamHandle> {
-        let stream_id = self.conn.open_realtime_stream(channel).await?;
+        let path = format!("/realtime?channel={}", channel);
+        let session_id = self.webtransport_connect(&path).await?;
+
+        let join_msg = RealtimeMessage::new("join", channel, serde_json::Value::Null);
+        let join_frame = crate::realtime::encode_realtime_frame(&join_msg)?;
+
+        let mut final_payload = crate::realtime::encode_quic_varint(session_id);
+        final_payload.extend_from_slice(&join_frame);
+
+        {
+            let mut quic = self.conn.quic.lock().await;
+            let _ = quic.dgram_send(&final_payload);
+        }
         self.flush().await?;
 
         let (tx, rx) = mpsc::channel(256);
@@ -390,7 +505,6 @@ impl H3ClientConn {
 
         tokio::spawn(async move {
             let mut recv_buf = [0u8; 65535];
-            let mut stream_buf: Vec<u8> = Vec::new();
             let mut out = [0u8; 1350];
 
             loop {
@@ -402,6 +516,7 @@ impl H3ClientConn {
                     to: local_addr,
                     from: server_addr,
                 };
+
                 {
                     let mut quic = conn.quic.lock().await;
                     if let Err(e) = quic.recv(&mut recv_buf[..len], recv_info) {
@@ -416,38 +531,36 @@ impl H3ClientConn {
                             Ok((w, _)) => {
                                 let _ = socket.send(&out[..w]).await;
                             }
-                            Err(quiche::Error::Done) => break,
-                            Err(_) => break,
+                            Err(quiche::Error::Done) | Err(_) => break,
                         }
                     }
                 }
 
-                let data = {
-                    let mut quic = conn.quic.lock().await;
-                    match quic.stream_recv(stream_id, &mut recv_buf) {
-                        Ok((n, _)) => recv_buf[..n].to_vec(),
-                        Err(quiche::Error::Done) => continue,
-                        Err(e) => {
-                            warn!("realtime stream_recv: {e}");
-                            break;
-                        }
-                    }
-                };
+                let mut dgram_buf = [0u8; 65535];
+                let mut quic = conn.quic.lock().await;
 
-                stream_buf.extend_from_slice(&data);
-                while let Some((msg, consumed)) = parse_realtime_frame(&stream_buf) {
-                    stream_buf.drain(..consumed);
-                    if tx.send(msg).await.is_err() {
-                        return;
+                while let Ok(d_len) = quic.dgram_recv(&mut dgram_buf) {
+                    let raw_data = &dgram_buf[..d_len];
+
+                    if let Some((_sid, varint_len)) = crate::realtime::decode_quic_varint(raw_data)
+                    {
+                        let actual_json = &raw_data[varint_len..];
+
+                        if let Some((msg, _)) = parse_realtime_frame(actual_json) {
+                            if tx.send(msg).await.is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
             }
         });
-
         Ok(RealtimeStreamHandle {
-            stream_id,
+            stream_id: session_id,
             conn: Arc::clone(&self.conn),
             rx,
+            channel: String::from(channel),
+            socket: Arc::clone(&self.socket),
         })
     }
 
@@ -476,7 +589,7 @@ impl H3ClientConn {
 impl Drop for H3ClientConn {
     fn drop(&mut self) {
         let closed = Arc::clone(&self.closed);
-        let socket = Arc::clone(&self.socket);
+        // let socket = Arc::clone(&self.socket);
         let conn = Arc::clone(&self.conn);
 
         if let Ok(mut flag) = closed.try_lock() {

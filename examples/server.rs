@@ -65,7 +65,10 @@ async fn main() -> Result<()> {
                         channel: ch,
                         stream_id,
                     } => {
-                        info!("[Realtime] {} joined channel '{}'", conn_id, ch);
+                        info!(
+                            "[Realtime] {} joined channel '{}' stream_id {}",
+                            conn_id, ch, stream_id
+                        );
 
                         channel
                             .broadcast(
@@ -95,13 +98,11 @@ async fn main() -> Result<()> {
                         msg,
                     } => {
                         info!(
-                            "[Realtime] msg from {} on '{}': {:?}",
-                            conn_id, msg.channel, msg.payload
+                            "[Realtime] msg from {} stream_id {} on '{}': {:?}",
+                            conn_id, stream_id, msg.channel, msg.payload
                         );
 
-                        channel
-                            .broadcast(&msg.channel, msg.clone(), Some(&conn_id))
-                            .await;
+                        channel.broadcast(&msg.channel, msg.clone(), None).await;
                     }
 
                     RealtimeEvent::Disconnected { conn_id } => {

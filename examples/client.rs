@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
 
     info!("=== Listening for incoming realtime messages... ===");
     loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(2), stream.recv()).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv()).await {
             Ok(Some(msg)) => {
                 info!("[Realtime] event='{}' payload={:?}", msg.event, msg.payload);
             }

@@ -58,6 +58,7 @@ impl QuicConfig {
         config.set_disable_active_migration(self.disable_active_migration);
         config.enable_dgram(true, 1000, 1000); // Enable quic DATAGRAM untuk realtime
         config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
+        config.enable_early_data();
 
         if let (Some(cert), Some(key)) = (&self.cert_path, &self.key_path) {
             config.load_cert_chain_from_pem_file(cert.to_str().unwrap())?;
