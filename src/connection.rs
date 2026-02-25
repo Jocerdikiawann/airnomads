@@ -101,7 +101,7 @@ impl QuicConnection {
         let handshake = RealtimeMessage {
             event: "join".to_string(),
             channel: channel.to_string(),
-            payload: serde_json::Value::Null,
+            payload: vec![],
         };
         let encoded = serde_json::to_vec(&handshake)?;
         let len = (encoded.len() as u32).to_be_bytes();

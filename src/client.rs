@@ -1,3 +1,4 @@
+use bytes::BytesMut;
 use quiche::h3::NameValue;
 use ring::rand::SecureRandom;
 use std::net::SocketAddr;
@@ -36,7 +37,7 @@ pub struct RealtimeStreamHandle {
 }
 
 impl RealtimeStreamHandle {
-    pub async fn send(&self, event: &str, payload: serde_json::Value) -> Result<()> {
+    pub async fn send(&self, event: &str, payload: Vec<u8>) -> Result<()> {
         let msg = RealtimeMessage::new(event, &self.channel, payload);
         let json_frame = crate::realtime::encode_realtime_frame(&msg)?;
 
@@ -50,7 +51,7 @@ impl RealtimeStreamHandle {
             }
         }
 
-        let mut out = [0u8; 1350];
+        let mut out = BytesMut::zeroed(1350);
         loop {
             let write = {
                 let mut quic = self.conn.quic.lock().await;
@@ -164,8 +165,8 @@ pub struct H3ClientConn {
 
 impl H3ClientConn {
     pub async fn handshake(&self) -> Result<()> {
-        let mut out = [0u8; 1350];
-        let mut buf = [0u8; 65535];
+        let mut out = BytesMut::zeroed(1350);
+        let mut buf = BytesMut::zeroed(65535);
         let timeout = std::time::Duration::from_secs(10);
         let start = Instant::now();
 
@@ -262,8 +263,8 @@ impl H3ClientConn {
         let mut resp_status = 0u16;
         let mut resp_headers = Vec::new();
         let mut resp_body = Vec::new();
-        let mut buf = [0u8; 65535];
-        let mut out = [0u8; 1350];
+        let mut buf = BytesMut::zeroed(65535);
+        let mut out = BytesMut::zeroed(1350);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
 
         loop {
@@ -336,7 +337,7 @@ impl H3ClientConn {
                     }
                 };
 
-                info!("rt_rx {:?}", self.rt_rx);
+                debug!("rt_rx {:?}", self.rt_rx);
                 match event {
                     (sid, quiche::h3::Event::Headers { list, .. }) if sid == stream_id => {
                         for hdr in &list {
@@ -351,7 +352,7 @@ impl H3ClientConn {
                     }
 
                     (sid, quiche::h3::Event::Data) if sid == stream_id => {
-                        let mut body_buf = [0u8; 65535];
+                        let mut body_buf = BytesMut::zeroed(65535);
                         let n = {
                             let mut quic = self.conn.quic.lock().await;
                             let mut h3g = self.conn.h3.lock().await;
@@ -414,7 +415,7 @@ impl H3ClientConn {
             if !quic.is_closed() {
                 let _ = quic.close(false, 0x0, reason.as_bytes());
             }
-            let mut out = [0u8; 1350];
+            let mut out = BytesMut::zeroed(1350);
             for _ in 0..3 {
                 match quic.send(&mut out) {
                     Ok((w, _)) => {
@@ -450,8 +451,8 @@ impl H3ClientConn {
 
         self.flush().await?;
 
-        let mut buf = [0u8; 65535];
-        let mut out = [0u8; 1350];
+        let mut buf = BytesMut::zeroed(65535);
+        let mut out = BytesMut::zeroed(1350);
 
         loop {
             let Ok(len) = self.socket.recv(&mut buf).await else {
@@ -507,7 +508,7 @@ impl H3ClientConn {
         let path = format!("/realtime?channel={}", channel);
         let session_id = self.webtransport_connect(&path).await?;
 
-        let join_msg = RealtimeMessage::new("join", channel, serde_json::Value::Null);
+        let join_msg = RealtimeMessage::new("join", channel, vec![]);
         let join_frame = crate::realtime::encode_realtime_frame(&join_msg)?;
 
         let mut final_payload = crate::realtime::encode_quic_varint(session_id);
@@ -526,8 +527,8 @@ impl H3ClientConn {
         let server_addr = self.server_addr;
 
         tokio::spawn(async move {
-            let mut recv_buf = [0u8; 65535];
-            let mut out = [0u8; 1350];
+            let mut recv_buf = BytesMut::zeroed(65535);
+            let mut out = BytesMut::zeroed(1350);
 
             loop {
                 let Ok(len) = socket.recv(&mut recv_buf).await else {
@@ -558,7 +559,7 @@ impl H3ClientConn {
                     }
                 }
 
-                let mut dgram_buf = [0u8; 65535];
+                let mut dgram_buf = BytesMut::zeroed(65535);
                 let mut quic = conn.quic.lock().await;
 
                 while let Ok(d_len) = quic.dgram_recv(&mut dgram_buf) {
@@ -603,7 +604,7 @@ impl H3ClientConn {
     }
 
     pub async fn flush(&self) -> Result<()> {
-        let mut out = [0u8; 1350];
+        let mut out = BytesMut::zeroed(1350);
         self.flush_raw(&mut out).await
     }
 }

@@ -1,7 +1,11 @@
+mod message;
+use message::Message;
+
 use airnomads::{
     H3Client, QuicConfig,
     error::{H3Error, Result},
 };
+
 use std::net::AddrParseError;
 use tracing::info;
 
@@ -44,21 +48,27 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         info!("=== Listening for incoming realtime messages... ===");
         while let Some(msg) = rx_stream.recv().await {
-            info!(
-                "[Realtime In] event='{}' payload={:?}",
-                msg.event, msg.payload
-            );
+            let buf = msg.payload;
+
+            let message: Message = serde_json::from_slice(&buf).unwrap_or(Message {
+                status: 0,
+                data: String::new(),
+            });
+
+            info!("[Realtime In] event='{}' payload={:?}", msg.event, message);
         }
         info!("Listener task closed.");
     });
 
     for i in 0..3 {
-        tx_stream
-            .send(
-                "message",
-                serde_json::json!({ "text": format!("Hello #{}", i) }),
-            )
-            .await?;
+        let mut buf = Vec::new();
+        let data: Message = Message {
+            status: 200,
+            data: format!("Hello #{}", i).to_string(),
+        };
+
+        serde_json::to_writer(&mut buf, &data)?;
+        tx_stream.send("message", buf).await?;
         info!("[Realtime Out] Sent message #{}", i);
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -66,7 +76,7 @@ async fn main() -> Result<()> {
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    tx_stream.send("leave", serde_json::Value::Null).await?;
+    tx_stream.send("leave", Vec::new()).await?;
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     Ok(())

@@ -1,3 +1,6 @@
+mod message;
+use message::Message;
+
 use std::net::{AddrParseError, SocketAddr};
 use std::sync::Arc;
 
@@ -70,18 +73,15 @@ async fn main() -> Result<()> {
                             conn_id, ch, stream_id
                         );
 
+                        let mut buf = Vec::new();
+                        let data: Message = Message {
+                            status: 200,
+                            data: format!("User {} joined", conn_id).to_string(),
+                        };
+
+                        serde_json::to_writer(&mut buf, &data).unwrap_or(());
                         channel
-                            .broadcast(
-                                &ch,
-                                RealtimeMessage::new(
-                                    "system",
-                                    &ch,
-                                    serde_json::json!({
-                                        "text": format!("User {} joined", conn_id),
-                                    }),
-                                ),
-                                None,
-                            )
+                            .broadcast(&ch, RealtimeMessage::new("system", &ch, buf), None)
                             .await;
                     }
 

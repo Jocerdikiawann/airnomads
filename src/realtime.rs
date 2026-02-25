@@ -10,16 +10,11 @@ use crate::error::{H3Error, Result};
 pub struct RealtimeMessage {
     pub event: String,
     pub channel: String,
-    #[serde(default)]
-    pub payload: serde_json::Value,
+    pub payload: Vec<u8>,
 }
 
 impl RealtimeMessage {
-    pub fn new(
-        event: impl Into<String>,
-        channel: impl Into<String>,
-        payload: serde_json::Value,
-    ) -> Self {
+    pub fn new(event: impl Into<String>, channel: impl Into<String>, payload: Vec<u8>) -> Self {
         Self {
             event: event.into(),
             channel: channel.into(),

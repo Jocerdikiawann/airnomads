@@ -1,3 +1,4 @@
+use bytes::BytesMut;
 use quiche::h3::NameValue;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -130,8 +131,8 @@ impl H3Server {
 
         let (resp_tx, mut resp_rx) = mpsc::channel::<PendingResponse>(256);
 
-        let mut buf = [0u8; 65535];
-        let mut out = [0u8; 1350];
+        let mut buf = BytesMut::zeroed(65535);
+        let mut out = BytesMut::zeroed(1350);
 
         loop {
             // let from: SocketAddr;
@@ -419,7 +420,7 @@ impl H3Server {
         channel: &Arc<RealtimeChannel>,
         socket: &Arc<UdpSocket>,
     ) {
-        let mut buf = [0u8; 65535];
+        let mut buf = BytesMut::zeroed(65535);
 
         let mut quic = conn.quic.lock().await;
 
@@ -456,7 +457,7 @@ impl H3Server {
                                 }
                                 drop(quic);
 
-                                let mut out = [0u8; 1350];
+                                let mut out = BytesMut::zeroed(1350);
                                 loop {
                                     let write = {
                                         let mut q = conn_c.quic.lock().await;
@@ -579,7 +580,7 @@ impl H3Server {
                 }
 
                 (stream_id, quiche::h3::Event::Data) => {
-                    let mut body_buf = [0u8; 65535];
+                    let mut body_buf = BytesMut::zeroed(65535);
                     let n = {
                         let mut quic = conn.quic.lock().await;
                         let mut h3g = conn.h3.lock().await;
@@ -636,7 +637,7 @@ impl H3Server {
                 }
             }
 
-            let mut buf = [0u8; 65535];
+            let mut buf = BytesMut::zeroed(65535);
             let n = {
                 let mut quic = conn.quic.lock().await;
                 match quic.stream_recv(stream_id, &mut buf) {
