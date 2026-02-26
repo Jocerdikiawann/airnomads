@@ -101,12 +101,15 @@ impl QuicConnection {
         let handshake = RealtimeMessage {
             event: "join".to_string(),
             channel: channel.to_string(),
-            payload: vec![],
+            payload: Vec::new(),
         };
-        let encoded = serde_json::to_vec(&handshake)?;
-        let len = (encoded.len() as u32).to_be_bytes();
+
+        let mut buf: Vec<u8> = Vec::new();
+
+        serde_json::to_writer(&mut buf, &handshake)?;
+        let len = (buf.len() as u32).to_be_bytes();
         quic.stream_send(stream_id, &len, false)?;
-        quic.stream_send(stream_id, &encoded, false)?;
+        quic.stream_send(stream_id, &buf, false)?;
 
         let mut streams = self.streams.lock().await;
         streams.insert(
@@ -128,7 +131,9 @@ impl QuicConnection {
 
     pub async fn send_realtime(&self, stream_id: u64, msg: &RealtimeMessage) -> Result<()> {
         let mut quic = self.quic.lock().await;
-        let encoded = serde_json::to_vec(msg)?;
+        let mut encoded: Vec<u8> = Vec::new();
+
+        serde_json::to_writer(&mut encoded, &msg)?;
         let len = (encoded.len() as u32).to_be_bytes();
         quic.stream_send(stream_id, &len, false)?;
         quic.stream_send(stream_id, &encoded, false)?;

@@ -35,10 +35,19 @@ async fn main() -> Result<()> {
     info!("Body: {}", String::from_utf8_lossy(&resp.body));
 
     info!("=== HTTP/3 POST /echo ===");
-    let resp = conn
-        .post_json("/echo", serde_json::json!({ "hello": "world" }))
-        .await?;
-    info!("Echo body: {}", String::from_utf8_lossy(&resp.body));
+
+    let mut buf = Vec::new();
+    let data = Message {
+        status: 200,
+        data: "Hello world".to_string(),
+    };
+    serde_json::to_writer(&mut buf, &data)?;
+    let resp = conn.post_json("/echo", Some(&buf)).await?;
+
+    info!(
+        "Echo Response body: {}",
+        String::from_utf8_lossy(&resp.body)
+    );
 
     info!("=== Realtime: joining channel 'chat' ===");
     let stream = conn.realtime_connect("chat").await?;
@@ -50,12 +59,11 @@ async fn main() -> Result<()> {
         while let Some(msg) = rx_stream.recv().await {
             let buf = msg.payload;
 
-            let message: Message = serde_json::from_slice(&buf).unwrap_or(Message {
-                status: 0,
-                data: String::new(),
-            });
-
-            info!("[Realtime In] event='{}' payload={:?}", msg.event, message);
+            info!(
+                "[Realtime In] event='{}' payload={:?}",
+                msg.event,
+                String::from_utf8_lossy(&buf)
+            );
         }
         info!("Listener task closed.");
     });
@@ -71,10 +79,8 @@ async fn main() -> Result<()> {
         tx_stream.send("message", buf).await?;
         info!("[Realtime Out] Sent message #{}", i);
 
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     tx_stream.send("leave", Vec::new()).await?;
 

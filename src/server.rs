@@ -49,15 +49,14 @@ pub struct H3Response {
 }
 
 impl H3Response {
-    pub fn json(status: u16, body: serde_json::Value) -> Self {
-        let body_bytes = body.to_string().into_bytes();
+    pub fn json(status: u16, body: Vec<u8>) -> Self {
         Self {
             status,
             headers: vec![
                 ("content-type".to_string(), "application/json".to_string()),
-                ("content-length".to_string(), body_bytes.len().to_string()),
+                ("content-length".to_string(), body.len().to_string()),
             ],
-            body: body_bytes,
+            body: body,
         }
     }
     pub fn ok(body: impl Into<Vec<u8>>) -> Self {
@@ -69,7 +68,7 @@ impl H3Response {
         }
     }
     pub fn not_found() -> Self {
-        Self::json(404, serde_json::json!({ "error": "not found" }))
+        Self::json(404, Vec::new())
     }
 }
 

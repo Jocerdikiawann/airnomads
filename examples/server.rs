@@ -34,13 +34,15 @@ async fn main() -> Result<()> {
                 );
 
                 match (req.method.as_str(), req.path.as_str()) {
-                    ("GET", "/") => H3Response::json(
-                        200,
-                        serde_json::json!({
-                            "message": "Hello from HTTP/3!",
-                            "conn_id": conn.conn_id,
-                        }),
-                    ),
+                    ("GET", "/") => {
+                        let msg = Message {
+                            status: 200,
+                            data: "Hello from http3".to_string(),
+                        };
+                        let mut buf = Vec::new();
+                        serde_json::to_writer(&mut buf, &msg).unwrap_or(());
+                        H3Response::json(200, buf)
+                    }
 
                     ("GET", "/health") => H3Response::ok(r#"{"status":"ok"}"#),
 

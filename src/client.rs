@@ -211,15 +211,9 @@ impl H3ClientConn {
         self.request("GET", path, &[], None).await
     }
 
-    pub async fn post_json(&self, path: &str, body: serde_json::Value) -> Result<H3ClientResponse> {
-        let body_bytes = serde_json::to_vec(&body)?;
-        self.request(
-            "POST",
-            path,
-            &[("content-type", "application/json")],
-            Some(&body_bytes),
-        )
-        .await
+    pub async fn post_json(&self, path: &str, body: Option<&[u8]>) -> Result<H3ClientResponse> {
+        self.request("POST", path, &[("content-type", "application/json")], body)
+            .await
     }
 
     pub async fn request(
