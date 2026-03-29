@@ -1,7 +1,7 @@
 ## h3-ntai experimental lib HTTP/3
 
-Library HTTP/3 berbasis Rust menggunakan Cloudflare Quiche, dengan dukungan
-realtime bidirectional streaming di atas native QUIC streams.
+A Rust-based HTTP/3 library using Cloudflare Quiche,  
+with support for real-time bidirectional streaming over native QUIC streams.
 
 ## Example
 
