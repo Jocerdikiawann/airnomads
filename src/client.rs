@@ -42,7 +42,7 @@ impl RealtimeStreamHandle {
         let msg = RealtimeMessage::new(event, &self.channel, payload);
         let json_frame = crate::realtime::encode_realtime_frame(&msg)?;
 
-        if self.mode == RealtimeMode::Unrealible {
+        if self.mode == RealtimeMode::Unreliable {
             let mut final_payload = crate::realtime::encode_quic_varint(self.stream_id);
             final_payload.extend_from_slice(&json_frame);
 
@@ -521,7 +521,7 @@ impl H3ClientConn {
         let join_msg = RealtimeMessage::new("join", channel, vec![]);
         let join_frame = crate::realtime::encode_realtime_frame(&join_msg)?;
 
-        if mode == RealtimeMode::Unrealible {
+        if mode == RealtimeMode::Unreliable {
             let mut final_payload = crate::realtime::encode_quic_varint(session_id);
             final_payload.extend_from_slice(&join_frame);
 
@@ -580,7 +580,7 @@ impl H3ClientConn {
                 }
 
                 let mut quic = conn.quic.lock().await;
-                if mode == RealtimeMode::Unrealible {
+                if mode == RealtimeMode::Unreliable {
                     let mut dgram_buf = BytesMut::zeroed(65535);
                     while let Ok(d_len) = quic.dgram_recv(&mut dgram_buf) {
                         let raw_data = &dgram_buf[..d_len];

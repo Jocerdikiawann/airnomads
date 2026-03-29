@@ -1,7 +1,7 @@
 mod message;
 use message::Message;
 
-use airnomads::{
+use h3_ntai::{
     H3Client, QuicConfig,
     error::{H3Error, Result},
     realtime::RealtimeMode,

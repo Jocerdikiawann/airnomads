@@ -4,8 +4,8 @@ use message::Message;
 use std::net::{AddrParseError, SocketAddr};
 use std::sync::Arc;
 
-use airnomads::error::H3Error;
-use airnomads::{
+use h3_ntai::error::H3Error;
+use h3_ntai::{
     H3Server, QuicConfig,
     error::Result,
     realtime::{RealtimeChannel, RealtimeEvent, RealtimeMessage},
@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
 
     let server = H3Server::new(bind, config)
         .on_request(
-            |req: H3Request, conn: Arc<airnomads::QuicConnection>| async move {
+            |req: H3Request, conn: Arc<h3_ntai::QuicConnection>| async move {
                 info!(
                     "[HTTP/3] {} {} from {}",
                     req.method, req.path, conn.peer_addr

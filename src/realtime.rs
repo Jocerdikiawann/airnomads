@@ -15,7 +15,7 @@ pub struct RealtimeMessage {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RealtimeMode {
-    Unrealible,
+    Unreliable,
     Reliable,
 }
 
